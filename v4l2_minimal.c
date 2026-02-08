@@ -15,6 +15,8 @@
 
 #define MINIMAL_CID_OVERLAY_ENABLE (V4L2_CID_USER_BASE + 0x1000)
 
+#define MINI_V4L2_CAP_OPTIONS (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_OUTPUT)
+
 
 struct v4l2_minimal_dev {
 	struct v4l2_device v4l2_dev;
@@ -23,6 +25,8 @@ struct v4l2_minimal_dev {
 
 	struct v4l2_ctrl_handler ctrl_handler;
 	bool overlay_enable;
+
+	struct v4l2_pix_format pix_fmt;
 };
 
 // Rathinavel has arrived
@@ -30,18 +34,19 @@ struct v4l2_minimal_dev {
 static struct v4l2_minimal_dev *min_dev;
 static struct platform_device *min_pdev;
 
-// struct minimal_fmt {
-// 	u32 pixelformat;
-// 	const char *desc;
-// };
+struct fmt {
+	u32 pixelformat;
+	const char *desc;
+	u8 bpp;
+};
 
-// static const struct minimal_fmt minimal_formats[] = {
-// 	{ V4L2_PIX_FMT_GREY, "8-bit Greyscale" },
-// 	{ V4L2_PIX_FMT_YUYV, "YUYV 4:2:2" },
-// 	{ V4L2_PIX_FMT_RGB24, "RGB24" },
-// };
+static const struct fmt formats[] = {
+	{ V4L2_PIX_FMT_GREY, "8-bit Greyscale", 1 },
+	{ V4L2_PIX_FMT_YUYV, "YUYV 4:2:2", 2 },
+	{ V4L2_PIX_FMT_RGB24, "RGB24", 3 },
+};
 
-// #define MINIMAL_NUM_FORMATS ARRAY_SIZE(minimal_formats)
+#define NUM_FORMATS ARRAY_SIZE(formats)
 
 static int minimal_open(struct file *file)
 {
@@ -107,7 +112,7 @@ static int minimal_vidioc_querycap(struct file *file, void *priv,
 				     struct v4l2_capability *cap)
 {
  /* set device_caps first */
-    cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+    cap->device_caps = MINI_V4L2_CAP_OPTIONS;
     cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 
     /* use fixed strings — don't dereference driver state here */
@@ -118,35 +123,32 @@ static int minimal_vidioc_querycap(struct file *file, void *priv,
 	return 0;
 }
 
+static int vidioc_enum_fmt(struct file *file, void *priv,
+					    struct v4l2_fmtdesc *f)
+{
 
+	pr_alert("Capture enum_fmt: type=%u index=%u\n", f->type, f->index);
 
-// static int minimal_vidioc_enum_fmt_vid_cap(struct file *file, void *priv,
-// 					    struct v4l2_fmtdesc *f)
-// {
+	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || f->type != V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+		pr_info("enum_fmt: bad type\n");
+		return -EINVAL;
+	}
 
-// 	pr_alert("enum_fmt: type=%u index=%u\n", f->type, f->index);
+	if (f->index >= NUM_FORMATS) {
+		pr_info("enum_fmt: index too big\n");
+		return -EINVAL;
+	}
 
+	f->pixelformat = formats[f->index].pixelformat;
+	strscpy(f->description, formats[f->index].desc, sizeof(f->description));
 
-// 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
-// 		pr_info("enum_fmt: bad type\n");
-// 		return -EINVAL;
-// 	}
-
-// 	if (f->index >= MINIMAL_NUM_FORMATS) {
-// 		pr_info("enum_fmt: index too big\n");
-// 		return -EINVAL;
-// 	}
-
-
-// 	f->pixelformat = minimal_formats[f->index].pixelformat;
-// 	strscpy(f->description, minimal_formats[f->index].desc, sizeof(f->description));
-
-// 	return 0;
-// }
+	return 0;
+}
 
 static const struct v4l2_ioctl_ops minimal_ioctl_ops = {
 	.vidioc_querycap = minimal_vidioc_querycap,
-//	.vidioc_enum_fmt_vid_cap = minimal_vidioc_enum_fmt_vid_cap
+	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt,
+	.vidioc_enum_fmt_vid_out = vidioc_enum_fmt,
 };
 
 static void v4l2_minimal_vdev_release(struct v4l2_minimal_dev *dev)
@@ -166,6 +168,14 @@ static int __init v4l2_minimal_init(void)
 		return -ENOMEM;
 
 	mutex_init(&min_dev->lock);
+
+	min_dev->pix_fmt.width = 640;
+	min_dev->pix_fmt.height = 480;
+	min_dev->pix_fmt.pixelformat = V4L2_PIX_FMT_YUYV;
+	min_dev->pix_fmt.field = V4L2_FIELD_NONE;
+	min_dev->pix_fmt.colorspace = V4L2_COLORSPACE_SRGB;
+	min_dev->pix_fmt.bytesperline = min_dev->pix_fmt.width * 2;
+	min_dev->pix_fmt.sizeimage = (min_dev->pix_fmt.height * min_dev->pix_fmt.bytesperline);
 
 	/* Create a simple parent device so v4l2_device has a struct device */
 	min_pdev = platform_device_register_simple("v4l2-minimal", -1, NULL, 0);
@@ -216,9 +226,9 @@ static int __init v4l2_minimal_init(void)
 	vdev->ioctl_ops  = &minimal_ioctl_ops;
 	vdev->release    = video_device_release_empty;
 	vdev->lock       = &min_dev->lock;
-	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+	vdev->device_caps = MINI_V4L2_CAP_OPTIONS;
 	vdev->vfl_type   = VFL_TYPE_VIDEO;
-	vdev->vfl_dir    = VFL_DIR_RX;
+	vdev->vfl_dir    = VFL_DIR_M2M;
 	vdev->dev_parent = &min_pdev->dev;
 	
 	vdev->ctrl_handler = &min_dev->ctrl_handler;
