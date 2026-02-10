@@ -15,8 +15,13 @@
 
 #define MINIMAL_CID_OVERLAY_ENABLE (V4L2_CID_USER_BASE + 0x1000)
 
-#define MINI_V4L2_CAP_OPTIONS (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_OUTPUT)
+#define MINI_V4L2_CAP_OPTIONS (V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_M2M)
 
+#define MIN_WIDTH 16
+#define MIN_HEIGHT 16 
+
+#define MAX_WIDTH 1920
+#define MAX_HEIGHT 1080
 
 struct v4l2_minimal_dev {
 	struct v4l2_device v4l2_dev;
@@ -27,6 +32,10 @@ struct v4l2_minimal_dev {
 	bool overlay_enable;
 
 	struct v4l2_pix_format pix_fmt;
+};
+
+struct minimal_ctx {
+	struct v4l2_fh fh;
 };
 
 // Rathinavel has arrived
@@ -52,16 +61,16 @@ static int minimal_open(struct file *file)
 {
 	struct video_device *vdev = video_devdata(file);
 	struct v4l2_minimal_dev *dev = video_get_drvdata(vdev);
-	struct v4l2_fh *fh;
+	struct minimal_ctx *ctx;
 
-	fh = kzalloc(sizeof(*fh), GFP_KERNEL);
-	if(!fh)
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if(!ctx)
 		return -ENOMEM;
 
-	v4l2_fh_init(fh, vdev);
-	v4l2_fh_add(fh);
+	v4l2_fh_init(&ctx->fh, vdev);
+	v4l2_fh_add(&ctx->fh);
 
-	file->private_data = fh;
+	file->private_data = &ctx->fh;
 
 	pr_info("minimal_open\n");
 	return 0;
@@ -70,12 +79,13 @@ static int minimal_open(struct file *file)
 static int minimal_release(struct file *file)
 {
 	struct v4l2_fh *fh = file->private_data;
+	struct minimal_ctx *ctx = container_of(fh, struct minimal_ctx, fh);
 
 	pr_info("minimal_release\n");
 
 	v4l2_fh_del(fh);
 	v4l2_fh_exit(fh);
-	kfree(fh);
+	kfree(ctx);
 
 	return 0;
 }
