@@ -53,3 +53,5 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+._v4l2_minimal.c
