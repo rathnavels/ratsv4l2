@@ -11,6 +11,10 @@
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-mem2mem.h>
+#include <media/v4l2-mem2mem.h>
+#include <media/videobuf2-v4l2.h>
+#include <media/videobuf2-dma-contig.h>
 
 #define PRIVCAM_DEF_WIDTH 640
 #define PRIVCAM_DEF_HEIGHT 480
@@ -22,7 +26,7 @@
 struct privcam_dev {
     struct v4l2_device v4l2_dev;
     struct video_device vdev;
-
+    struct v4l2_m2m_dev *m2m_dev;
     
     struct mutex lock;
 };
@@ -40,6 +44,21 @@ struct privcam_ctx {
 
 static struct privcam_dev *privcam;
 static struct platform_device *pdev;
+
+static void privcam_device_run(void *priv)
+{
+
+}
+
+static void privcam_job_abort(void *priv)
+{
+
+}
+
+static const struct v4l2_m2m_ops privcam_m2m_ops = {
+    .device_run = privcam_device_run,
+    .job_abort = privcam_job_abort,
+};
 
 static void privcam_fill_fmt(struct v4l2_pix_format *f)
 {
@@ -206,6 +225,16 @@ static int __init privcam_init(void)
 
     pr_err("Cleared v4l2 dev registration\n");
 
+    privcam->m2m_dev = v4l2_m2m_init(&privcam_m2m_ops);
+    if (IS_ERR(privcam->m2m_dev)) {
+        ret = PTR_ERR(privcam->m2m_dev);
+        privcam->m2m_dev = NULL;
+        pr_err("v4l2_m2m_init failed: %d\n", ret);
+        goto err_v4l2;
+    }
+
+    pr_err("Cleared v4l2-m2m init\n");
+
     strscpy(privcam->vdev.name, "privcam", sizeof(privcam->vdev.name));
 
     privcam->vdev.v4l2_dev = &privcam->v4l2_dev;
@@ -221,13 +250,16 @@ static int __init privcam_init(void)
 
     ret = video_register_device(&privcam->vdev, VFL_TYPE_VIDEO, -1);
     if(ret)
-        goto err_v4l2;
+        goto err_video;
 
     pr_err("Cleared video dev registration\n");
 
     pr_info("privcam registered as /dev/video%d\n", privcam->vdev.num);
     return 0;
 
+err_video:
+    if(privcam->m2m_dev)
+        v4l2_m2m_release(privcam->m2m_dev);
 err_v4l2:
     v4l2_device_unregister(&privcam->v4l2_dev);
 err_pdev:
@@ -244,6 +276,8 @@ static void __exit privcam_exit(void)
 {
 
     video_unregister_device(&privcam->vdev);
+    if(privcam->m2m_dev)
+        v4l2_m2m_release(privcam->m2m_dev);
     v4l2_device_unregister(&privcam->v4l2_dev);
     platform_device_unregister(pdev);
     kfree(privcam);
