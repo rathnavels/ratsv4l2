@@ -21,7 +21,10 @@
 #define PRIVCAM_DEF_PIXFMT V4L2_PIX_FMT_RGBX32
 #define PRIVCAM_BPP 4
 
-#define PRIVCAM_CAPS (V4L2_CAP_VIDEO_M2M | V4L2_CAP_DEVICE_CAPS)
+#define PRIVCAM_CAPS (V4L2_CAP_VIDEO_M2M | V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING)
+
+#define BUFTYPE_OUT V4L2_BUF_TYPE_VIDEO_OUTPUT
+#define BUFTYPE_CAP V4L2_BUF_TYPE_VIDEO_CAPTURE
 
 struct privcam_dev {
     struct v4l2_device v4l2_dev;
@@ -40,25 +43,195 @@ struct privcam_ctx {
     struct v4l2_pix_format cap_fmt;
     
     u32 sequence;
+    spinlock_t qlock; /* vb2 queue lock */
 };
 
 static struct privcam_dev *privcam;
 static struct platform_device *pdev;
 
+static int privcam_job_ready(void *priv)
+{
+    struct privcam_ctx *ctx = priv;
+
+    return (v4l2_m2m_num_src_bufs_ready(ctx->m2m_ctx) > 0) &&
+            (v4l2_m2m_num_dst_bufs_ready(ctx->m2m_ctx) > 0);
+}
+
 static void privcam_device_run(void *priv)
 {
+    struct privcam_ctx *ctx = priv;
+    struct vb2_v4l2_buffer *src, *dst;
+
+    void *src_vaddr, *dst_vaddr;
+    u32 sz;
+
+    src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
+    dst = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
+
+    if(!src || !dst)
+        goto finish;
+
+    /* For MMAP (contig) this works. For imported DMABUF, vaddr may be NULL (we’ll handle later). */
+    src_vaddr = vb2_plane_vaddr(&src->vb2_buf, 0);
+    dst_vaddr = vb2_plane_vaddr(&dst->vb2_buf, 0);
+
+    sz = min(vb2_get_plane_payload(&src->vb2_buf, 0), vb2_plane_size(&dst->vb2_buf, 0));
+
+    if(!src_vaddr || !dst_vaddr) {
+        v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+        v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
+        goto finish;
+    }
+
+    memcpy(dst_vaddr, src_vaddr, sz);
+
+    vb2_set_plane_payload(&dst->vb2_buf, 0, sz);
+
+    dst->vb2_buf.timestamp = src->vb2_buf.timestamp;
+    dst->sequence = ctx->sequence++;
+    src->sequence = dst->sequence;
+
+    v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+    v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
+    
+finish:
+    v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->m2m_ctx);
 
 }
 
+
 static void privcam_job_abort(void *priv)
 {
-
+    struct privcam_ctx *ctx = priv;
+    v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->m2m_ctx);
 }
 
 static const struct v4l2_m2m_ops privcam_m2m_ops = {
     .device_run = privcam_device_run,
+    .job_ready = privcam_job_ready,
     .job_abort = privcam_job_abort,
 };
+
+static inline struct privcam_ctx *fh_to_ctx(struct v4l2_fh *fh)
+{
+    return container_of(fh, struct privcam_ctx, fh);
+}
+
+static int privcam_queue_setup(struct vb2_queue *vq,
+                                unsigned int *nbufs,
+                                unsigned int *nplanes,
+                                unsigned int sizes[],
+                                struct device *alloc_devs[])
+{
+    struct privcam_ctx *ctx = vb2_get_drv_priv(vq);
+    struct v4l2_pix_format *pf;
+
+    if (vq->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+        pf = &ctx->out_fmt;
+    else
+        pf = &ctx->cap_fmt;
+
+    *nplanes = 1;
+    sizes[0] = pf->sizeimage;
+
+    if(*nbufs < 2)
+        *nbufs = 2;
+
+    return 0;    
+}
+
+static int privcam_buf_prepare(struct vb2_buffer *vb)
+{
+    struct privcam_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+    struct v4l2_pix_format *pf;
+
+    if (vb->vb2_queue->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+        pf = &ctx->out_fmt;
+    else
+        pf = &ctx->cap_fmt;
+
+    if(vb2_plane_size(vb, 0) < pf->sizeimage)
+        return -EINVAL;
+
+    vb2_set_plane_payload(vb, 0, pf->sizeimage);
+    return 0;
+}
+
+static void privcam_buf_queue(struct vb2_buffer *vb)
+{
+    struct privcam_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+
+    v4l2_m2m_buf_queue(ctx->m2m_ctx, vbuf);
+}
+
+static int privcam_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+    return 0;
+}
+
+static void privcam_stop_streaming(struct vb2_queue *vq)
+{
+    struct privcam_ctx *ctx = vb2_get_drv_priv(vq);
+    struct vb2_v4l2_buffer *buf;
+
+
+    if(vq->type == V4L2_BUF_TYPE_VIDEO_OUTPUT) {
+        while ((buf = v4l2_m2m_src_buf_remove(ctx->m2m_ctx)))
+            v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
+    } else {
+         while ((buf = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx)))
+            v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
+    }
+}
+
+static const struct vb2_ops privcam_vb2_ops = {
+    .queue_setup = privcam_queue_setup,
+    .buf_prepare = privcam_buf_prepare,
+    .buf_queue = privcam_buf_queue,
+    .start_streaming = privcam_start_streaming,
+    .stop_streaming = privcam_stop_streaming,
+    .wait_prepare = vb2_ops_wait_prepare,
+    .wait_finish = vb2_ops_wait_finish,
+};
+
+static int privcam_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_vq)
+{
+    struct privcam_ctx *ctx = priv;
+    int ret;
+
+    // Output/Source queue
+    src_vq->type = BUFTYPE_OUT;
+    src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+    src_vq->drv_priv = ctx;
+    src_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
+    src_vq->ops = &privcam_vb2_ops;
+    src_vq->mem_ops = &vb2_dma_contig_memops;
+    src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+    src_vq->lock = &ctx->dev->lock;
+    src_vq->dev = ctx->dev->v4l2_dev.dev;
+
+    ret = vb2_queue_init(src_vq);
+    if(ret)
+    {
+        pr_err("Src queue init failed\n");
+        return ret;
+    }
+
+    // Dest/Capture queue
+    dst_vq->type = BUFTYPE_CAP;
+    dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+    dst_vq->drv_priv = ctx;
+    dst_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
+    dst_vq->ops = &privcam_vb2_ops;
+    dst_vq->mem_ops = &vb2_dma_contig_memops;
+    dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+    dst_vq->lock = &ctx->dev->lock;
+    dst_vq->dev = ctx->dev->v4l2_dev.dev;
+    
+    return vb2_queue_init(dst_vq);
+    
+}
 
 static void privcam_fill_fmt(struct v4l2_pix_format *f)
 {
@@ -83,7 +256,8 @@ static int privcam_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *
 
 static int privcam_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
-    struct privcam_ctx *ctx = priv;
+    struct v4l2_fh *fh = priv;
+    struct privcam_ctx *ctx = container_of(fh, struct privcam_ctx, fh);
     struct v4l2_pix_format *pix = &f->fmt.pix;
 
     if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
@@ -108,7 +282,8 @@ static int privcam_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 static int privcam_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
-    struct privcam_ctx *ctx = priv;
+    struct v4l2_fh *fh = priv;
+    struct privcam_ctx *ctx = container_of(fh, struct privcam_ctx, fh);
     int ret;
 
     ret = privcam_try_fmt(file, priv, f);
@@ -149,6 +324,16 @@ static const struct v4l2_ioctl_ops privcam_ioctl_ops = {
     .vidioc_s_fmt_vid_out = privcam_s_fmt,
 
     .vidioc_querycap = privcam_querycap,
+
+    .vidioc_reqbufs       = v4l2_m2m_ioctl_reqbufs,
+    .vidioc_create_bufs   = v4l2_m2m_ioctl_create_bufs,
+    .vidioc_querybuf      = v4l2_m2m_ioctl_querybuf,
+    .vidioc_qbuf          = v4l2_m2m_ioctl_qbuf,
+    .vidioc_dqbuf         = v4l2_m2m_ioctl_dqbuf,
+    .vidioc_streamon      = v4l2_m2m_ioctl_streamon,
+    .vidioc_streamoff     = v4l2_m2m_ioctl_streamoff,
+    .vidioc_expbuf        = v4l2_m2m_ioctl_expbuf,
+
 };
 
 
@@ -156,10 +341,13 @@ static int privcam_open(struct file *file)
 {
     struct privcam_dev *dev = video_drvdata(file);
     struct privcam_ctx *ctx;
+    int ret;
 
     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
     if(!ctx)
         return -ENOMEM;
+
+    spin_lock_init(&ctx->qlock);
 
     v4l2_fh_init(&ctx->fh, &dev->vdev);
     v4l2_fh_add(&ctx->fh);
@@ -171,6 +359,19 @@ static int privcam_open(struct file *file)
     privcam_fill_fmt(&ctx->out_fmt);
     privcam_fill_fmt(&ctx->cap_fmt);
 
+    ctx->m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx, privcam_queue_init);
+    if(IS_ERR(ctx->m2m_ctx)) {
+        ret = PTR_ERR(ctx->m2m_ctx);
+        ctx->m2m_ctx = NULL;
+        v4l2_fh_del(&ctx->fh);
+        v4l2_fh_exit(&ctx->fh);
+
+        kfree(ctx);
+        return ret;
+    }
+
+    ctx->fh.m2m_ctx = ctx->m2m_ctx;
+
     return 0;
 }
 
@@ -178,6 +379,11 @@ static int privcam_release(struct file *file)
 {
     struct v4l2_fh *fh = file->private_data;
     struct privcam_ctx *ctx = container_of(fh, struct privcam_ctx, fh);
+
+    if(ctx->m2m_ctx) {
+        ctx->fh.m2m_ctx = NULL;
+        v4l2_m2m_ctx_release(ctx->m2m_ctx);
+    }
 
     v4l2_fh_del(&ctx->fh);
     v4l2_fh_exit(fh);
@@ -190,7 +396,9 @@ static const struct v4l2_file_operations privcam_fops = {
     .owner = THIS_MODULE,
     .open = privcam_open,
     .release = privcam_release,
+    .poll = v4l2_m2m_fop_poll,
     .unlocked_ioctl = video_ioctl2,
+    .mmap = v4l2_m2m_fop_mmap,   // checkgdc
 };
 
 
@@ -214,8 +422,11 @@ static int __init privcam_init(void)
 
     pr_err("Cleared pdev registration\n");
 
+    // When this name was not given, it was having issues.
     strscpy(privcam->v4l2_dev.name, "privcam", sizeof(privcam->v4l2_dev.name));
 
+    // v4l2 device register must be done with a parent device which is the platform device, it may compile with NULL
+    // but has issues during insmod.
     ret = v4l2_device_register(&pdev->dev, &privcam->v4l2_dev);
     if(ret)
     {

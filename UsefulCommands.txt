@@ -1,0 +1,6 @@
+
+
+v4l2-ctl -d /dev/video2 \
+  --stream-out-mmap=4 --stream-from=/dev/zero \
+  --stream-mmap=4 --stream-to=/dev/null \
+  --stream-count=1
