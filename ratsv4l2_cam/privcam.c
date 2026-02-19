@@ -5,6 +5,7 @@
 #include <linux/slab.h>
 #include <linux/platform_device.h>
 #include <linux/mutex.h>
+#include <linux/dma-buf.h>
 
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
@@ -18,7 +19,7 @@
 
 #define PRIVCAM_DEF_WIDTH 640
 #define PRIVCAM_DEF_HEIGHT 480
-#define PRIVCAM_DEF_PIXFMT V4L2_PIX_FMT_RGBX32
+#define PRIVCAM_DEF_PIXFMT V4L2_PIX_FMT_YUYV
 #define PRIVCAM_BPP 4
 
 #define PRIVCAM_CAPS (V4L2_CAP_VIDEO_M2M | V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING)
@@ -61,27 +62,26 @@ static void privcam_device_run(void *priv)
 {
     struct privcam_ctx *ctx = priv;
     struct vb2_v4l2_buffer *src, *dst;
-
     void *src_vaddr, *dst_vaddr;
     u32 sz;
 
     src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
     dst = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
 
-    if(!src || !dst)
+    if (!src || !dst)
         goto finish;
 
-    /* For MMAP (contig) this works. For imported DMABUF, vaddr may be NULL (we’ll handle later). */
     src_vaddr = vb2_plane_vaddr(&src->vb2_buf, 0);
     dst_vaddr = vb2_plane_vaddr(&dst->vb2_buf, 0);
 
-    sz = min(vb2_get_plane_payload(&src->vb2_buf, 0), vb2_plane_size(&dst->vb2_buf, 0));
-
-    if(!src_vaddr || !dst_vaddr) {
+    if (!src_vaddr || !dst_vaddr) {
         v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
         v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
         goto finish;
     }
+
+    sz = min(vb2_get_plane_payload(&src->vb2_buf, 0),
+             vb2_plane_size(&dst->vb2_buf, 0));
 
     memcpy(dst_vaddr, src_vaddr, sz);
 
@@ -93,7 +93,7 @@ static void privcam_device_run(void *priv)
 
     v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
     v4l2_m2m_buf_done(dst, VB2_BUF_STATE_DONE);
-    
+
 finish:
     v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->m2m_ctx);
 
@@ -233,14 +233,14 @@ static int privcam_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_q
     
 }
 
-static void privcam_fill_fmt(struct v4l2_pix_format *f)
+static void privcam_fill_fmt(struct v4l2_pix_format *f, u32 w, u32 h)
 {
-    f->width = PRIVCAM_DEF_WIDTH;
-    f->height = PRIVCAM_DEF_HEIGHT;
+    f->width = w;
+    f->height = h;
     f->pixelformat = PRIVCAM_DEF_PIXFMT;
 
     f->field = V4L2_FIELD_NONE;
-    f->bytesperline = f->width * 4;
+    f->bytesperline = f->width * 2;
     f->sizeimage = f->bytesperline * f->height;
     f->colorspace = V4L2_COLORSPACE_SRGB;
 }
@@ -270,13 +270,20 @@ static int privcam_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 static int privcam_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
-    struct v4l2_pix_format *pix = &f->fmt.pix;
 
-    if(pix->pixelformat != PRIVCAM_DEF_PIXFMT)
+    struct v4l2_pix_format *pix = &f->fmt.pix;
+    u32 w, h;
+
+    if (pix->pixelformat != PRIVCAM_DEF_PIXFMT)
         return -EINVAL;
 
-    privcam_fill_fmt(pix);
+    w = pix->width ? pix->width : PRIVCAM_DEF_WIDTH;
+    h = pix->height ? pix->height : PRIVCAM_DEF_HEIGHT;
 
+    /* YUYV needs even width */
+    w &= ~1U;
+
+    privcam_fill_fmt(pix, w, h);
     return 0;
 }
 
@@ -356,8 +363,8 @@ static int privcam_open(struct file *file)
 
     ctx->dev = dev;
 
-    privcam_fill_fmt(&ctx->out_fmt);
-    privcam_fill_fmt(&ctx->cap_fmt);
+    privcam_fill_fmt(&ctx->out_fmt, PRIVCAM_DEF_WIDTH, PRIVCAM_DEF_HEIGHT);
+    privcam_fill_fmt(&ctx->cap_fmt, PRIVCAM_DEF_WIDTH, PRIVCAM_DEF_HEIGHT);
 
     ctx->m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx, privcam_queue_init);
     if(IS_ERR(ctx->m2m_ctx)) {
