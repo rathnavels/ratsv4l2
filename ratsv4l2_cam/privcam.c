@@ -6,6 +6,7 @@
 #include <linux/platform_device.h>
 #include <linux/mutex.h>
 #include <linux/dma-buf.h>
+#include <linux/scatterlist.h>
 
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
@@ -13,19 +14,22 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-mem2mem.h>
-#include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
+#include <media/videobuf2-vmalloc.h>
+#include <media/videobuf2-dma-sg.h>
 
 #define PRIVCAM_DEF_WIDTH 640
 #define PRIVCAM_DEF_HEIGHT 480
 #define PRIVCAM_DEF_PIXFMT V4L2_PIX_FMT_YUYV
-#define PRIVCAM_BPP 4
+#define PRIVCAM_BPP 2
 
 #define PRIVCAM_CAPS (V4L2_CAP_VIDEO_M2M | V4L2_CAP_DEVICE_CAPS | V4L2_CAP_STREAMING)
 
 #define BUFTYPE_OUT V4L2_BUF_TYPE_VIDEO_OUTPUT
 #define BUFTYPE_CAP V4L2_BUF_TYPE_VIDEO_CAPTURE
+
+#define USE_DMABUF 1
 
 struct privcam_dev {
     struct v4l2_device v4l2_dev;
@@ -50,6 +54,47 @@ struct privcam_ctx {
 static struct privcam_dev *privcam;
 static struct platform_device *pdev;
 
+static size_t privcam_sg_copy(struct sg_table *src, struct sg_table *dst, size_t bytes)
+{
+    struct sg_mapping_iter s, d;
+    size_t copied = 0;
+
+    sg_miter_start(&s, src->sgl, src->nents, SG_MITER_FROM_SG);
+    sg_miter_start(&d, dst->sgl, dst->nents, SG_MITER_TO_SG);
+
+    if (!sg_miter_next(&s) || !sg_miter_next(&d))
+        goto out;
+
+    while (copied < bytes) {
+        size_t chunk = bytes - copied;
+
+        if (chunk > s.length) chunk = s.length;
+        if (chunk > d.length) chunk = d.length;
+
+        memcpy(d.addr, s.addr, chunk);
+        copied += chunk;
+
+        s.addr = (char *)s.addr + chunk;
+        s.length -= chunk;
+        d.addr = (char *)d.addr + chunk;
+        d.length -= chunk;
+
+        if (s.length == 0) {
+            if (!sg_miter_next(&s))
+                break;
+        }
+        if (d.length == 0) {
+            if (!sg_miter_next(&d))
+                break;
+        }
+    }
+
+out:
+    sg_miter_stop(&d);
+    sg_miter_stop(&s);
+    return copied;
+}
+
 static int privcam_job_ready(void *priv)
 {
     struct privcam_ctx *ctx = priv;
@@ -62,7 +107,14 @@ static void privcam_device_run(void *priv)
 {
     struct privcam_ctx *ctx = priv;
     struct vb2_v4l2_buffer *src, *dst;
+#ifdef USE_DMABUF
+    struct sg_table *src_sgt;
+    //struct sg_table *dst_sgt;
+    size_t copied;
+    void *dst_vaddr;
+#else
     void *src_vaddr, *dst_vaddr;
+#endif
     u32 sz;
 
     src = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
@@ -71,19 +123,60 @@ static void privcam_device_run(void *priv)
     if (!src || !dst)
         goto finish;
 
+    sz = min(vb2_get_plane_payload(&src->vb2_buf, 0),
+                vb2_plane_size(&dst->vb2_buf, 0));
+    
+#ifdef USE_DMABUF
+    src_sgt = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
+//    dst_sgt = vb2_dma_sg_plane_desc(&src->vb2_buf, 0);
+#else
     src_vaddr = vb2_plane_vaddr(&src->vb2_buf, 0);
+#endif
+
     dst_vaddr = vb2_plane_vaddr(&dst->vb2_buf, 0);
 
+#ifdef USE_DMABUF
+    if (!src_sgt || !dst_vaddr) {
+#else
     if (!src_vaddr || !dst_vaddr) {
+#endif
         v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
         v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
         goto finish;
     }
 
-    sz = min(vb2_get_plane_payload(&src->vb2_buf, 0),
-             vb2_plane_size(&dst->vb2_buf, 0));
+#ifdef USE_DMABUF
+    /* copy sg -> linear */
+    copied = 0;
+    {
+        struct sg_mapping_iter s;
+        size_t remain = sz;
+        uint8_t *out = dst_vaddr;
 
+        sg_miter_start(&s, src_sgt->sgl, src_sgt->nents, SG_MITER_FROM_SG);
+        while (remain && sg_miter_next(&s)) {
+            size_t chunk = s.length;
+            if (chunk > remain) chunk = remain;
+            memcpy(out, s.addr, chunk);
+            out += chunk;
+            remain -= chunk;
+            copied += chunk;
+        }
+        sg_miter_stop(&s);
+    }
+#endif
+
+#ifdef USE_DMABUF
+    //copied = privcam_sg_copy(src_sgt, dst_sgt, sz);
+    if(copied != sz)
+    {
+        v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
+        v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
+        goto finish;
+    }
+#else    
     memcpy(dst_vaddr, src_vaddr, sz);
+#endif
 
     vb2_set_plane_payload(&dst->vb2_buf, 0, sz);
 
@@ -96,7 +189,6 @@ static void privcam_device_run(void *priv)
 
 finish:
     v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->m2m_ctx);
-
 }
 
 
@@ -206,10 +298,15 @@ static int privcam_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_q
     src_vq->drv_priv = ctx;
     src_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
     src_vq->ops = &privcam_vb2_ops;
+#ifdef USE_DMABUF
+    src_vq->mem_ops = &vb2_dma_sg_memops;
+#else
     src_vq->mem_ops = &vb2_dma_contig_memops;
+#endif
     src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
     src_vq->lock = &ctx->dev->lock;
-    src_vq->dev = ctx->dev->v4l2_dev.dev;
+ //   src_vq->dev = ctx->dev->v4l2_dev.dev;
+    src_vq->dev = &pdev->dev;
 
     ret = vb2_queue_init(src_vq);
     if(ret)
@@ -220,11 +317,15 @@ static int privcam_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_q
 
     // Dest/Capture queue
     dst_vq->type = BUFTYPE_CAP;
-    dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+    dst_vq->io_modes = VB2_MMAP;
     dst_vq->drv_priv = ctx;
     dst_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
     dst_vq->ops = &privcam_vb2_ops;
+#ifdef USE_DMABUF
+    dst_vq->mem_ops = &vb2_vmalloc_memops;
+#else
     dst_vq->mem_ops = &vb2_dma_contig_memops;
+#endif
     dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
     dst_vq->lock = &ctx->dev->lock;
     dst_vq->dev = ctx->dev->v4l2_dev.dev;
