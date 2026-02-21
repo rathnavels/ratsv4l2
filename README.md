@@ -8,3 +8,6 @@ as input buffer.  The app eventually gets the capture buffer back from the custo
 
 sudo modprobe videobuf2-dma-sg
 
+### To run the app, compile using below commands
+gcc -O2 -Wall -Wextra -o dmaheap dmaheap_to_privam.c
+./dmaheap in.yuyv out.yuyv
