@@ -57,3 +57,5 @@ dkms.conf
 ._v4l2_minimal.c
 privcam
 privcam_dma
+dma_mp
+.vscode/
